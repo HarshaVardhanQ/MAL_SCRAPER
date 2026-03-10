@@ -1,5 +1,3 @@
-This commit introduces a full desktop GUI application for scraping seasonal anime data from MyAnimeList (MAL), focused specifically on "TV New" anime entries.
-
 The application is built using CustomTkinter and provides a modern dark-themed interface for browsing seasonal anime information.
 
 Key Features
