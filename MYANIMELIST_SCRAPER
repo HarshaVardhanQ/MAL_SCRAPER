@@ -1,0 +1,1053 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import messagebox
+import threading
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ImageTk, ImageDraw
+import io
+import webbrowser
+import csv
+import os
+import time
+from datetime import datetime
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+P = {
+    "bg_deep":      "#080A14",
+    "bg_card":      "#0F1120",
+    "bg_card2":     "#111425",
+    "bg_panel":     "#161929",
+    "bg_hover":     "#1C2038",
+    "accent":       "#7C6FFF",
+    "accent_glow":  "#9D93FF",
+    "accent3":      "#36EFA0",
+    "text_h":       "#F0F0FF",
+    "text_p":       "#A0A2C8",
+    "text_m":       "#4E5070",
+    "border":       "#222540",
+    "border2":      "#2E3158",
+    "gold":         "#FFD84D",
+    "tag_bg":       "#1E2245",
+    "blue_light":   "#5EC8FA",
+    "white":        "#FFFFFF",
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+SEASONS = ["winter", "spring", "summer", "fall"]
+SEASON_LABELS = {"winter": "Winter", "spring": "Spring", "summer": "Summer", "fall": "Fall"}
+SEASON_ACCENT = {
+    "winter": "#5EC8FA",
+    "spring": "#FF9ED2",
+    "summer": "#FFD84D",
+    "fall":   "#FF8C5A",
+}
+
+IMG_CACHE = {}
+COVER_GRID_SIZE  = (160, 225)
+COVER_LIST_SIZE  = (95, 135)
+
+
+# ─── Scraper ──────────────────────────────────────────────────────────────────
+def scrape_season_tv(year, season, progress_cb=None):
+    """
+    Scrape only TV (New) anime from MAL seasonal page.
+    MAL separates sections by div.js-seasonal-anime-list with data-key.
+    TV New = list-key-1, which contains the header 'TV New'.
+    We also pass ?type=tv to the URL to pre-filter server-side.
+    """
+    url = f"https://myanimelist.net/anime/season/{year}/{season}"
+    params = {"type": "tv"}
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Find the TV New section specifically
+    # It is inside: div.seasonal-anime-list.js-seasonal-anime-list-key-1
+    tv_section = soup.select_one(
+        "div.seasonal-anime-list.js-seasonal-anime-list-key-1"
+    )
+
+    if tv_section:
+        cards = tv_section.select(
+            "div.js-seasonal-anime.seasonal-anime.js-anime-type-1"
+        )
+    else:
+        # Fallback: grab all type-1 cards from full page
+        cards = soup.select(
+            "div.js-seasonal-anime.seasonal-anime.js-anime-type-1"
+        )
+
+    # Extra safety: exclude kids section if needed
+    # (kids cards have class 'kids js-kids' - we keep them unless excluded)
+    results = []
+    total = len(cards)
+
+    for i, card in enumerate(cards):
+        # ── Title ────────────────────────────────────────────────────────────
+        title_tag = card.select_one("h2.h2_anime_title a, a.link-title")
+        title = title_tag.get_text(strip=True) if title_tag else "N/A"
+
+        sub_tag = card.select_one("h3.h3_anime_subtitle")
+        subtitle = sub_tag.get_text(strip=True) if sub_tag else ""
+
+        mal_link = title_tag.get("href", "") if title_tag else ""
+        if mal_link and not mal_link.startswith("http"):
+            mal_link = "https://myanimelist.net" + mal_link
+
+        # ── Release date ─────────────────────────────────────────────────────
+        date_tag = card.select_one("span.js-startdate")
+        raw_date = date_tag.get_text(strip=True) if date_tag else ""
+        release_date = ""
+        if raw_date:
+            try:
+                dt = datetime.strptime(raw_date, "%Y%m%d")
+                release_date = dt.strftime("%b %d, %Y")
+            except Exception:
+                pass
+        if not release_date:
+            info_span = card.select_one("div.info span.item")
+            release_date = info_span.get_text(strip=True) if info_span else "N/A"
+
+        # ── Genres ───────────────────────────────────────────────────────────
+        genres = [
+            g.get_text(strip=True)
+            for g in card.select("div.genres-inner span.genre a")
+        ]
+
+        # ── Cover image ──────────────────────────────────────────────────────
+        img_tag = card.select_one("div.image img")
+        img_url = ""
+        if img_tag:
+            img_url = (
+                img_tag.get("data-src")
+                or img_tag.get("src", "")
+            )
+            if not img_url:
+                srcset = img_tag.get("data-srcset") or img_tag.get("srcset", "")
+                if srcset:
+                    img_url = srcset.split(",")[0].strip().split(" ")[0]
+
+        # ── Score & Members ──────────────────────────────────────────────────
+        score_tag  = card.select_one("span.js-score")
+        score      = score_tag.get_text(strip=True) if score_tag else "N/A"
+        mem_tag    = card.select_one("span.js-members")
+        members    = mem_tag.get_text(strip=True) if mem_tag else "N/A"
+
+        # ── Properties: Studio, Source, Themes, Demographics ─────────────────
+        studio = source = ""
+        themes = []
+        demographics = []
+
+        for prop in card.select("div.property"):
+            cap = prop.select_one("span.caption")
+            if not cap:
+                continue
+            cap_text = cap.get_text(strip=True)
+            if "Studio" in cap_text:
+                items = prop.select("span.item a")
+                studio = ", ".join(a.get_text(strip=True) for a in items)
+                if not studio:
+                    it = prop.select_one("span.item")
+                    studio = it.get_text(strip=True) if it else ""
+            elif "Source" in cap_text:
+                it = prop.select_one("span.item")
+                source = it.get_text(strip=True) if it else ""
+            elif "Theme" in cap_text:
+                themes = [a.get_text(strip=True) for a in prop.select("span.item a")]
+            elif "Demographic" in cap_text:
+                demographics = [a.get_text(strip=True) for a in prop.select("span.item a")]
+
+        # ── Episodes info ─────────────────────────────────────────────────────
+        info_tag = card.select_one("div.info")
+        eps_info = ""
+        if info_tag:
+            eps_info = " | ".join(
+                s.get_text(strip=True)
+                for s in info_tag.select("span.item")
+                if s.get_text(strip=True)
+            )
+
+        # ── Synopsis ──────────────────────────────────────────────────────────
+        syn_tag  = card.select_one("p.preline")
+        synopsis = syn_tag.get_text(strip=True) if syn_tag else ""
+
+        results.append({
+            "title":        title,
+            "subtitle":     subtitle,
+            "release_date": release_date,
+            "genres":       genres,
+            "themes":       themes,
+            "demographics": demographics,
+            "score":        score,
+            "members":      members,
+            "studio":       studio,
+            "source":       source,
+            "synopsis":     synopsis,
+            "img_url":      img_url,
+            "mal_link":     mal_link,
+            "eps_info":     eps_info,
+            "type":         "TV",
+        })
+
+        if progress_cb:
+            progress_cb(i + 1, total)
+
+    return results
+
+
+# ─── Image helpers ────────────────────────────────────────────────────────────
+def get_cover(url, size):
+    key = (url, size)
+    if key in IMG_CACHE:
+        return IMG_CACHE[key]
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=8)
+        img  = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        img  = img.resize(size, Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        IMG_CACHE[key] = photo
+        return photo
+    except Exception:
+        return None
+
+
+def make_placeholder(size):
+    img  = Image.new("RGB", size, color="#12152A")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, size[0]-1, size[1]-1], outline="#2A2E55", width=2)
+    cx, cy = size[0]//2, size[1]//2
+    draw.text((cx - 4, cy - 6), "?", fill="#3A3E65")
+    return ImageTk.PhotoImage(img)
+
+
+def make_tag(parent, text, bg=None, fg=None):
+    return tk.Label(
+        parent, text=text,
+        bg=bg or P["tag_bg"], fg=fg or P["accent"],
+        font=("Segoe UI", 7, "bold"),
+        padx=5, pady=2, relief="flat",
+    )
+
+
+# ─── Grid Card ────────────────────────────────────────────────────────────────
+class GridCard(tk.Frame):
+    def __init__(self, master, data, **kwargs):
+        super().__init__(
+            master, bg=P["bg_card"], relief="flat", bd=0,
+            highlightthickness=1, highlightbackground=P["border"],
+            cursor="hand2", **kwargs,
+        )
+        self.data = data
+        self._ph  = make_placeholder(COVER_GRID_SIZE)
+        self._build()
+        self._bind_hover(self)
+
+    def _build(self):
+        d = self.data
+
+        # Cover
+        self.cover_lbl = tk.Label(
+            self, image=self._ph, bg=P["bg_card"],
+            relief="flat", bd=0,
+        )
+        self.cover_lbl.pack(fill="x")
+
+        # TV badge overlay
+        badge_row = tk.Frame(self, bg=P["bg_card"])
+        badge_row.pack(fill="x", padx=8, pady=(4, 0))
+        tk.Label(
+            badge_row, text="TV NEW",
+            bg="#7C6FFF", fg=P["white"],
+            font=("Segoe UI", 7, "bold"), padx=5, pady=1,
+        ).pack(side="left")
+
+        body = tk.Frame(self, bg=P["bg_card"])
+        body.pack(fill="both", expand=True, padx=9, pady=(5, 9))
+
+        # Title
+        tk.Label(
+            body, text=d["title"],
+            bg=P["bg_card"], fg=P["text_h"],
+            font=("Segoe UI", 9, "bold"),
+            wraplength=148, justify="left", anchor="w",
+        ).pack(anchor="w")
+
+        if d.get("subtitle"):
+            tk.Label(
+                body, text=d["subtitle"],
+                bg=P["bg_card"], fg=P["text_m"],
+                font=("Segoe UI", 7, "italic"),
+                wraplength=148, justify="left",
+            ).pack(anchor="w", pady=(0, 2))
+
+        # Score + members
+        r1 = tk.Frame(body, bg=P["bg_card"])
+        r1.pack(anchor="w", pady=(4, 0))
+        score = d.get("score", "N/A")
+        sc    = P["gold"] if score not in ("N/A", "0", "") else P["text_m"]
+        tk.Label(
+            r1, text="* " + (score if score not in ("N/A", "0", "") else "N/A"),
+            bg=P["bg_card"], fg=sc,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left")
+        if d.get("members") and d["members"] != "N/A":
+            tk.Label(
+                r1, text="  " + d["members"] + " users",
+                bg=P["bg_card"], fg=P["text_m"],
+                font=("Segoe UI", 7),
+            ).pack(side="left")
+
+        # Date
+        if d.get("release_date"):
+            tk.Label(
+                body, text=d["release_date"],
+                bg=P["bg_card"], fg=P["accent3"],
+                font=("Segoe UI", 8),
+            ).pack(anchor="w", pady=(2, 0))
+
+        # Eps
+        if d.get("eps_info"):
+            tk.Label(
+                body, text=d["eps_info"],
+                bg=P["bg_card"], fg=P["text_p"],
+                font=("Segoe UI", 7),
+            ).pack(anchor="w")
+
+        # Studio
+        if d.get("studio"):
+            tk.Label(
+                body, text=d["studio"],
+                bg=P["bg_card"], fg=P["blue_light"],
+                font=("Segoe UI", 7),
+            ).pack(anchor="w", pady=(1, 0))
+
+        # Source
+        if d.get("source"):
+            tk.Label(
+                body, text="Src: " + d["source"],
+                bg=P["bg_card"], fg=P["text_m"],
+                font=("Segoe UI", 7),
+            ).pack(anchor="w")
+
+        # Genre tags
+        tags = d.get("genres", [])[:4]
+        if tags:
+            gf = tk.Frame(body, bg=P["bg_card"])
+            gf.pack(anchor="w", pady=(5, 2))
+            for g in tags:
+                make_tag(gf, g).pack(side="left", padx=1)
+
+        # Themes
+        th = d.get("themes", [])[:2]
+        if th:
+            tf = tk.Frame(body, bg=P["bg_card"])
+            tf.pack(anchor="w", pady=(1, 0))
+            for t in th:
+                make_tag(tf, t, bg="#1A2535", fg="#5EC8FA").pack(side="left", padx=1)
+
+        # Demographics
+        dm = d.get("demographics", [])
+        if dm:
+            df = tk.Frame(body, bg=P["bg_card"])
+            df.pack(anchor="w", pady=(1, 0))
+            for de in dm:
+                make_tag(df, de, bg="#1F1A35", fg="#C47EFF").pack(side="left", padx=1)
+
+        # Synopsis preview
+        syn = d.get("synopsis", "")
+        if syn:
+            prev = syn[:110] + ("..." if len(syn) > 110 else "")
+            tk.Label(
+                body, text=prev,
+                bg=P["bg_card"], fg=P["text_m"],
+                font=("Segoe UI", 7),
+                wraplength=150, justify="left",
+            ).pack(anchor="w", pady=(5, 0))
+
+        # MAL link
+        if d.get("mal_link"):
+            lnk = tk.Label(
+                body, text="Open on MAL ->",
+                bg=P["bg_card"], fg=P["accent"],
+                font=("Segoe UI", 7, "underline"), cursor="hand2",
+            )
+            lnk.pack(anchor="w", pady=(6, 0))
+            lnk.bind("<Button-1>", lambda e: webbrowser.open(d["mal_link"]))
+
+    def _bind_hover(self, w):
+        if not (isinstance(w, tk.Label) and w.cget("cursor") == "hand2" and w != self):
+            w.bind("<Enter>", self._enter)
+            w.bind("<Leave>", self._leave)
+        for c in w.winfo_children():
+            self._bind_hover(c)
+
+    def _enter(self, e=None):
+        self._recolor(P["bg_hover"])
+        self.config(highlightbackground=P["accent"])
+
+    def _leave(self, e=None):
+        self._recolor(P["bg_card"])
+        self.config(highlightbackground=P["border"])
+
+    def _recolor(self, col):
+        def r(w):
+            try:
+                if isinstance(w, (tk.Frame, tk.Label)):
+                    w.config(bg=col)
+            except Exception:
+                pass
+            for c in w.winfo_children():
+                r(c)
+        r(self)
+
+    def set_cover(self, photo):
+        self.cover_lbl.config(image=photo)
+        self.cover_lbl.image = photo
+
+
+# ─── List Row ─────────────────────────────────────────────────────────────────
+class ListRow(tk.Frame):
+    def __init__(self, master, data, is_odd=False, **kwargs):
+        bg = P["bg_card2"] if is_odd else P["bg_card"]
+        super().__init__(
+            master, bg=bg, relief="flat", bd=0,
+            highlightthickness=1, highlightbackground=P["border"],
+            cursor="hand2", **kwargs,
+        )
+        self.data  = data
+        self._bg   = bg
+        self._ph   = make_placeholder(COVER_LIST_SIZE)
+        self._build()
+        self._bind_hover(self)
+
+    def _build(self):
+        d = self.data
+
+        # Cover
+        cf = tk.Frame(self, bg=self._bg)
+        cf.pack(side="left", padx=(12, 0), pady=12)
+        self.cover_lbl = tk.Label(cf, image=self._ph, bg=self._bg, relief="flat", bd=0)
+        self.cover_lbl.pack()
+
+        # TV NEW badge under cover
+        tk.Label(
+            cf, text="TV NEW",
+            bg="#7C6FFF", fg=P["white"],
+            font=("Segoe UI", 7, "bold"), padx=4, pady=1,
+        ).pack(pady=(3, 0))
+
+        # Content
+        cnt = tk.Frame(self, bg=self._bg)
+        cnt.pack(side="left", fill="both", expand=True, padx=14, pady=12)
+
+        # Title row
+        tr = tk.Frame(cnt, bg=self._bg)
+        tr.pack(anchor="w", fill="x")
+        tk.Label(
+            tr, text=d["title"],
+            bg=self._bg, fg=P["text_h"],
+            font=("Segoe UI", 11, "bold"), anchor="w",
+        ).pack(side="left")
+        if d.get("subtitle"):
+            tk.Label(
+                tr, text="  /  " + d["subtitle"],
+                bg=self._bg, fg=P["text_m"],
+                font=("Segoe UI", 9, "italic"),
+            ).pack(side="left")
+
+        # Meta row
+        mr = tk.Frame(cnt, bg=self._bg)
+        mr.pack(anchor="w", pady=(5, 0))
+
+        score = d.get("score", "N/A")
+        sc    = P["gold"] if score not in ("N/A", "0", "") else P["text_m"]
+        tk.Label(
+            mr, text="* " + (score if score not in ("N/A", "0", "") else "N/A"),
+            bg=self._bg, fg=sc, font=("Segoe UI", 10, "bold"),
+        ).pack(side="left", padx=(0, 14))
+
+        if d.get("release_date"):
+            tk.Label(
+                mr, text=d["release_date"],
+                bg=self._bg, fg=P["accent3"],
+                font=("Segoe UI", 9),
+            ).pack(side="left", padx=(0, 14))
+
+        if d.get("eps_info"):
+            tk.Label(
+                mr, text=d["eps_info"],
+                bg=self._bg, fg=P["text_p"],
+                font=("Segoe UI", 9),
+            ).pack(side="left", padx=(0, 14))
+
+        if d.get("members") and d["members"] != "N/A":
+            tk.Label(
+                mr, text=d["members"] + " members",
+                bg=self._bg, fg=P["text_m"],
+                font=("Segoe UI", 9),
+            ).pack(side="left", padx=(0, 14))
+
+        if d.get("studio"):
+            tk.Label(
+                mr, text=d["studio"],
+                bg=self._bg, fg=P["blue_light"],
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+
+        # Source
+        if d.get("source"):
+            tk.Label(
+                cnt, text="Source: " + d["source"],
+                bg=self._bg, fg=P["text_m"],
+                font=("Segoe UI", 8),
+            ).pack(anchor="w", pady=(2, 0))
+
+        # Tags row (genres + themes + demographics)
+        all_tags = d.get("genres", []) + d.get("themes", []) + d.get("demographics", [])
+        if all_tags:
+            tagrow = tk.Frame(cnt, bg=self._bg)
+            tagrow.pack(anchor="w", pady=(6, 0))
+            for t in all_tags[:10]:
+                tg = d.get("themes", [])
+                dm = d.get("demographics", [])
+                if t in tg:
+                    lbl = make_tag(tagrow, t, bg="#1A2535", fg="#5EC8FA")
+                elif t in dm:
+                    lbl = make_tag(tagrow, t, bg="#1F1A35", fg="#C47EFF")
+                else:
+                    lbl = make_tag(tagrow, t)
+                lbl.pack(side="left", padx=2)
+
+        # Synopsis
+        syn = d.get("synopsis", "")
+        if syn:
+            prev = syn[:240] + ("..." if len(syn) > 240 else "")
+            tk.Label(
+                cnt, text=prev,
+                bg=self._bg, fg=P["text_p"],
+                font=("Segoe UI", 8),
+                wraplength=640, justify="left",
+            ).pack(anchor="w", pady=(6, 0))
+
+        # Right column: MAL button
+        rc = tk.Frame(self, bg=self._bg)
+        rc.pack(side="right", padx=16, pady=12)
+        if d.get("mal_link"):
+            ctk.CTkButton(
+                rc, text="View on MAL",
+                fg_color=P["accent"], hover_color=P["accent_glow"],
+                font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                width=105, height=30, corner_radius=8,
+                command=lambda: webbrowser.open(d["mal_link"]),
+            ).pack()
+
+    def _bind_hover(self, w):
+        try:
+            if not isinstance(w, ctk.CTkButton):
+                w.bind("<Enter>", self._enter)
+                w.bind("<Leave>", self._leave)
+        except Exception:
+            pass
+        for c in w.winfo_children():
+            self._bind_hover(c)
+
+    def _enter(self, e=None):
+        self._recolor(P["bg_hover"])
+        self.config(highlightbackground=P["accent"])
+
+    def _leave(self, e=None):
+        self._recolor(self._bg)
+        self.config(highlightbackground=P["border"])
+
+    def _recolor(self, col):
+        def r(w):
+            try:
+                if isinstance(w, (tk.Frame, tk.Label)):
+                    w.config(bg=col)
+            except Exception:
+                pass
+            for c in w.winfo_children():
+                r(c)
+        r(self)
+
+    def set_cover(self, photo):
+        self.cover_lbl.config(image=photo)
+        self.cover_lbl.image = photo
+
+
+# ─── Main Application ─────────────────────────────────────────────────────────
+class MALScraperApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("MAL Seasonal Anime Scraper  |  TV New Only")
+        self.geometry("1380x880")
+        self.minsize(980, 660)
+        self.configure(fg_color=P["bg_deep"])
+
+        self._results     = []
+        self._filtered    = []
+        self._cards       = []
+        self._loading     = False
+        self._view        = "grid"
+
+        self._build_ui()
+        self._tick_clock()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        # Top bar
+        top = ctk.CTkFrame(self, fg_color=P["bg_panel"], corner_radius=0, height=56)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+
+        ctk.CTkLabel(
+            top,
+            text="MAL Seasonal Anime Scraper  |  TV New",
+            font=ctk.CTkFont("Segoe UI", 17, "bold"),
+            text_color=P["text_h"],
+        ).pack(side="left", padx=20)
+
+        # TV NEW badge in topbar
+        ctk.CTkLabel(
+            top,
+            text="TV NEW ONLY",
+            fg_color=P["accent"],
+            corner_radius=6,
+            font=ctk.CTkFont("Segoe UI", 10, "bold"),
+            text_color=P["white"],
+            padx=8, pady=3,
+        ).pack(side="left", padx=10)
+
+        self.clock_lbl = ctk.CTkLabel(
+            top, text="",
+            font=ctk.CTkFont("Segoe UI", 10),
+            text_color=P["text_m"],
+        )
+        self.clock_lbl.pack(side="right", padx=20)
+
+        # Sidebar
+        side = ctk.CTkFrame(self, fg_color=P["bg_panel"], width=232, corner_radius=0)
+        side.pack(fill="y", side="left")
+        side.pack_propagate(False)
+
+        # Logo
+        logo = ctk.CTkFrame(side, fg_color=P["bg_deep"], corner_radius=12)
+        logo.pack(fill="x", padx=14, pady=(18, 6))
+        ctk.CTkLabel(
+            logo, text="Anime\nScraper",
+            font=ctk.CTkFont("Segoe UI", 18, "bold"),
+            text_color=P["accent"], justify="center",
+        ).pack(pady=14)
+
+        ctk.CTkFrame(side, fg_color=P["border"], height=1).pack(fill="x", padx=14, pady=6)
+
+        # Year
+        ctk.CTkLabel(side, text="Year", font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=P["text_p"]).pack(anchor="w", padx=16, pady=(8, 3))
+        self.year_var = ctk.StringVar(value=str(datetime.now().year))
+        ctk.CTkEntry(
+            side, textvariable=self.year_var,
+            font=ctk.CTkFont("Segoe UI", 14, "bold"),
+            fg_color=P["bg_deep"], border_color=P["border2"],
+            text_color=P["text_h"], height=40, corner_radius=10,
+        ).pack(fill="x", padx=14, pady=(0, 6))
+
+        # Season
+        ctk.CTkLabel(side, text="Season", font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=P["text_p"]).pack(anchor="w", padx=16, pady=(6, 3))
+        self.season_var = ctk.StringVar(value="winter")
+        self._sbtns = {}
+        for s in SEASONS:
+            b = ctk.CTkButton(
+                side, text=SEASON_LABELS[s],
+                command=lambda x=s: self._pick(x),
+                fg_color=P["bg_deep"], hover_color=P["bg_hover"],
+                border_color=P["border2"], border_width=1,
+                font=ctk.CTkFont("Segoe UI", 11),
+                text_color=P["text_p"], height=34, corner_radius=9,
+            )
+            b.pack(fill="x", padx=14, pady=2)
+            self._sbtns[s] = b
+        self._pick("winter")
+
+        ctk.CTkFrame(side, fg_color=P["border"], height=1).pack(fill="x", padx=14, pady=10)
+
+        # Fetch button
+        self.fetch_btn = ctk.CTkButton(
+            side, text="Fetch TV Anime",
+            command=self._start_fetch,
+            fg_color=P["accent"], hover_color=P["accent_glow"],
+            font=ctk.CTkFont("Segoe UI", 13, "bold"),
+            height=44, corner_radius=12,
+        )
+        self.fetch_btn.pack(fill="x", padx=14, pady=(0, 6))
+
+        # Export CSV
+        ctk.CTkButton(
+            side, text="Export CSV",
+            command=self._export,
+            fg_color=P["bg_deep"], hover_color=P["bg_hover"],
+            border_color=P["border2"], border_width=1,
+            font=ctk.CTkFont("Segoe UI", 11),
+            text_color=P["text_p"], height=34, corner_radius=9,
+        ).pack(fill="x", padx=14, pady=2)
+
+        ctk.CTkFrame(side, fg_color=P["border"], height=1).pack(fill="x", padx=14, pady=10)
+
+        # Progress
+        ctk.CTkLabel(side, text="Progress", font=ctk.CTkFont("Segoe UI", 9),
+                     text_color=P["text_m"]).pack(anchor="w", padx=16, pady=(0, 3))
+        self.pbar = ctk.CTkProgressBar(
+            side, fg_color=P["bg_deep"], progress_color=P["accent"], height=7, corner_radius=4,
+        )
+        self.pbar.pack(fill="x", padx=14)
+        self.pbar.set(0)
+
+        self.status_lbl = ctk.CTkLabel(
+            side, text="Ready",
+            font=ctk.CTkFont("Segoe UI", 9), text_color=P["text_m"],
+        )
+        self.status_lbl.pack(anchor="w", padx=16, pady=(3, 0))
+
+        # Stats box
+        sb = ctk.CTkFrame(side, fg_color=P["bg_deep"], corner_radius=10)
+        sb.pack(fill="x", padx=14, pady=(12, 0))
+        self.stats_lbl = ctk.CTkLabel(
+            sb, text="No data loaded",
+            font=ctk.CTkFont("Segoe UI", 9), text_color=P["text_m"], justify="left",
+        )
+        self.stats_lbl.pack(anchor="w", padx=10, pady=8)
+
+        # ── Main area ─────────────────────────────────────────────────────────
+        main = ctk.CTkFrame(self, fg_color=P["bg_deep"], corner_radius=0)
+        main.pack(fill="both", expand=True)
+
+        # Toolbar
+        tbar = ctk.CTkFrame(main, fg_color=P["bg_panel"], height=52, corner_radius=0)
+        tbar.pack(fill="x")
+        tbar.pack_propagate(False)
+
+        self.search_var = ctk.StringVar()
+        self.search_var.trace_add("write", lambda *a: self._filter())
+        ctk.CTkEntry(
+            tbar, textvariable=self.search_var,
+            placeholder_text="Search title, genre, studio...",
+            fg_color=P["bg_deep"], border_color=P["border2"],
+            text_color=P["text_h"], width=270, height=32,
+            corner_radius=9, font=ctk.CTkFont("Segoe UI", 11),
+        ).pack(side="left", padx=14, pady=10)
+
+        ctk.CTkLabel(tbar, text="Sort:", font=ctk.CTkFont("Segoe UI", 10),
+                     text_color=P["text_p"]).pack(side="left", padx=(8, 3))
+        self.sort_var = ctk.StringVar(value="Title")
+        ctk.CTkOptionMenu(
+            tbar, variable=self.sort_var,
+            values=["Title", "Score", "Date", "Members"],
+            command=lambda v: self._filter(),
+            fg_color=P["bg_deep"], button_color=P["accent"],
+            button_hover_color=P["accent_glow"],
+            dropdown_fg_color=P["bg_panel"],
+            font=ctk.CTkFont("Segoe UI", 10),
+            text_color=P["text_h"], width=105, corner_radius=8,
+        ).pack(side="left", padx=3)
+
+        ctk.CTkLabel(tbar, text="Genre:", font=ctk.CTkFont("Segoe UI", 10),
+                     text_color=P["text_p"]).pack(side="left", padx=(10, 3))
+        self.genre_var = ctk.StringVar(value="All")
+        self.genre_menu = ctk.CTkOptionMenu(
+            tbar, variable=self.genre_var, values=["All"],
+            command=lambda v: self._filter(),
+            fg_color=P["bg_deep"], button_color=P["accent"],
+            button_hover_color=P["accent_glow"],
+            dropdown_fg_color=P["bg_panel"],
+            font=ctk.CTkFont("Segoe UI", 10),
+            text_color=P["text_h"], width=135, corner_radius=8,
+        )
+        self.genre_menu.pack(side="left", padx=3)
+
+        # View toggle
+        tog = ctk.CTkFrame(tbar, fg_color=P["bg_deep"], corner_radius=8)
+        tog.pack(side="right", padx=14, pady=10)
+        self._gbtn = ctk.CTkButton(
+            tog, text="Grid",
+            fg_color=P["accent"], hover_color=P["accent_glow"],
+            font=ctk.CTkFont("Segoe UI", 10, "bold"),
+            width=58, height=30, corner_radius=7,
+            command=lambda: self._set_view("grid"),
+        )
+        self._gbtn.pack(side="left", padx=(3, 1), pady=3)
+        self._lbtn = ctk.CTkButton(
+            tog, text="List",
+            fg_color=P["bg_panel"], hover_color=P["bg_hover"],
+            font=ctk.CTkFont("Segoe UI", 10),
+            width=58, height=30, corner_radius=7,
+            command=lambda: self._set_view("list"),
+        )
+        self._lbtn.pack(side="left", padx=(1, 3), pady=3)
+
+        self.count_lbl = ctk.CTkLabel(
+            tbar, text="", font=ctk.CTkFont("Segoe UI", 10), text_color=P["text_m"],
+        )
+        self.count_lbl.pack(side="right", padx=8)
+
+        # Canvas scroll area
+        cw = ctk.CTkFrame(main, fg_color=P["bg_deep"])
+        cw.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(cw, bg=P["bg_deep"], highlightthickness=0)
+        self.vsb = ctk.CTkScrollbar(
+            cw, command=self.canvas.yview,
+            fg_color=P["bg_panel"], button_color=P["accent"],
+            button_hover_color=P["accent_glow"],
+        )
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.cf = tk.Frame(self.canvas, bg=P["bg_deep"])
+        self._win = self.canvas.create_window((0, 0), window=self.cf, anchor="nw")
+
+        self.cf.bind("<Configure>",
+                     lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._on_resize)
+        self.canvas.bind_all("<MouseWheel>",
+                             lambda e: self.canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+        tk.Label(
+            self.cf,
+            text="Select a Year and Season, then click Fetch TV Anime",
+            bg=P["bg_deep"], fg=P["text_m"],
+            font=("Segoe UI", 15), justify="center",
+        ).pack(pady=160)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _tick_clock(self):
+        self.clock_lbl.configure(text=datetime.now().strftime("%A, %d %b %Y  %H:%M:%S"))
+        self.after(1000, self._tick_clock)
+
+    def _pick(self, s):
+        self.season_var.set(s)
+        col = SEASON_ACCENT.get(s, P["accent"])
+        for k, b in self._sbtns.items():
+            if k == s:
+                b.configure(fg_color=col, text_color=P["white"], border_color=col)
+            else:
+                b.configure(fg_color=P["bg_deep"], text_color=P["text_p"],
+                            border_color=P["border2"])
+
+    def _set_view(self, mode):
+        self._view = mode
+        self._gbtn.configure(fg_color=P["accent"] if mode=="grid" else P["bg_panel"])
+        self._lbtn.configure(fg_color=P["accent"] if mode=="list" else P["bg_panel"])
+        self._rebuild()
+
+    def _on_resize(self, e=None):
+        self.canvas.itemconfig(self._win, width=e.width)
+        self._rebuild()
+
+    # ── Fetch ─────────────────────────────────────────────────────────────────
+    def _start_fetch(self):
+        if self._loading:
+            return
+        y = self.year_var.get().strip()
+        if not y.isdigit() or not (1917 <= int(y) <= 2030):
+            messagebox.showerror("Invalid Year", "Enter a valid year (1917-2030).")
+            return
+        season = self.season_var.get()
+        year   = int(y)
+
+        self._loading = True
+        self.fetch_btn.configure(state="disabled", text="Fetching...")
+        self.pbar.set(0)
+        self.status_lbl.configure(text=f"Fetching {SEASON_LABELS[season]} {year} TV...")
+        self._clear()
+
+        def worker():
+            def pcb(done, total):
+                self.after(0, lambda: self.pbar.set(done / max(total, 1)))
+                self.after(0, lambda: self.status_lbl.configure(
+                    text=f"Parsed {done}/{total} TV entries..."))
+            data = scrape_season_tv(year, season, pcb)
+            self.after(0, lambda: self._done(data, year, season))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _done(self, data, year, season):
+        self._loading = False
+        self.fetch_btn.configure(state="normal", text="Fetch TV Anime")
+        self.pbar.set(1)
+
+        if not data:
+            self.status_lbl.configure(text="No TV data. MAL may be rate-limiting.")
+            messagebox.showwarning("No Results",
+                "No TV anime found.\n\nMAL may be blocking — try again in a moment.")
+            return
+
+        self._results = data
+        self._refresh_genres()
+        self._filter()
+
+        scores = [float(d["score"]) for d in data if d.get("score") not in ("N/A","0","")]
+        avg    = round(sum(scores)/len(scores), 2) if scores else "N/A"
+        self.stats_lbl.configure(
+            text=f"TV New: {len(data)}\nAvg Score: {avg}\n{SEASON_LABELS[season]} {year}"
+        )
+        self.status_lbl.configure(text=f"Done - {len(data)} TV anime loaded")
+
+    # ── Filter & Sort ─────────────────────────────────────────────────────────
+    def _refresh_genres(self):
+        all_g = sorted(set(g for d in self._results for g in d.get("genres", [])))
+        self.genre_var.set("All")
+        self.genre_menu.configure(values=["All"] + all_g)
+
+    def _filter(self):
+        q  = self.search_var.get().strip().lower()
+        gf = self.genre_var.get()
+        out = []
+        for d in self._results:
+            if q:
+                hay = (
+                    d.get("title","").lower()
+                    + " ".join(d.get("genres",[])).lower()
+                    + d.get("studio","").lower()
+                    + d.get("synopsis","").lower()
+                )
+                if q not in hay:
+                    continue
+            if gf != "All" and gf not in d.get("genres",[]):
+                continue
+            out.append(d)
+
+        srt = self.sort_var.get()
+        if srt == "Score":
+            out.sort(key=lambda d: float(d["score"]) if d.get("score") not in ("N/A","0","") else 0, reverse=True)
+        elif srt == "Date":
+            def pd(s):
+                for fmt in ("%b %d, %Y", "%b %Y"):
+                    try:
+                        return datetime.strptime(s, fmt)
+                    except Exception:
+                        pass
+                return datetime.min
+            out.sort(key=lambda d: pd(d.get("release_date","")))
+        elif srt == "Members":
+            def pm(s):
+                s = s.replace("K","000").replace(".","").replace(",","")
+                try:
+                    return int(s)
+                except Exception:
+                    return 0
+            out.sort(key=lambda d: pm(d.get("members","0")), reverse=True)
+        else:
+            out.sort(key=lambda d: d.get("title","").lower())
+
+        self._filtered = out
+        self.count_lbl.configure(text=f"{len(out)} TV results")
+        self._rebuild()
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    def _clear(self):
+        for w in self.cf.winfo_children():
+            w.destroy()
+        self._cards.clear()
+
+    def _rebuild(self):
+        self._clear()
+        if not self._filtered:
+            tk.Label(
+                self.cf, text="No TV anime results found.",
+                bg=P["bg_deep"], fg=P["text_m"],
+                font=("Segoe UI", 14),
+            ).pack(pady=80)
+            return
+        if self._view == "grid":
+            self._build_grid()
+        else:
+            self._build_list()
+
+    def _build_grid(self):
+        cw    = self.canvas.winfo_width() or 1080
+        CARDW = 188
+        PAD   = 14
+        OUTER = 16
+        cols  = max(1, (cw - OUTER*2 + PAD) // (CARDW + PAD))
+
+        wrap = tk.Frame(self.cf, bg=P["bg_deep"])
+        wrap.pack(fill="both", expand=True, padx=OUTER, pady=OUTER)
+
+        for i, data in enumerate(self._filtered):
+            card = GridCard(wrap, data)
+            card.grid(row=i//cols, column=i%cols,
+                      padx=PAD//2, pady=PAD//2, sticky="n")
+            self._cards.append(card)
+
+        self._lazy_covers(self._cards, self._filtered, COVER_GRID_SIZE)
+
+    def _build_list(self):
+        wrap = tk.Frame(self.cf, bg=P["bg_deep"])
+        wrap.pack(fill="both", expand=True, padx=16, pady=14)
+
+        for i, data in enumerate(self._filtered):
+            row = ListRow(wrap, data, is_odd=(i%2==1))
+            row.pack(fill="x", pady=5)
+            self._cards.append(row)
+
+        self._lazy_covers(self._cards, self._filtered, COVER_LIST_SIZE)
+
+    def _lazy_covers(self, widgets, data_list, size):
+        pairs = list(zip(widgets, data_list))
+        def load():
+            for w, d in pairs:
+                url = d.get("img_url","")
+                if not url:
+                    continue
+                photo = get_cover(url, size)
+                if photo:
+                    try:
+                        w.after(0, lambda ww=w, p=photo: ww.set_cover(p))
+                    except Exception:
+                        pass
+                time.sleep(0.025)
+        threading.Thread(target=load, daemon=True).start()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    def _export(self):
+        if not self._filtered:
+            messagebox.showwarning("No Data", "Nothing to export.")
+            return
+        fn = f"mal_tv_{self.year_var.get()}_{self.season_var.get()}.csv"
+        fields = ["title","subtitle","release_date","genres","themes",
+                  "demographics","score","members","studio","source",
+                  "synopsis","eps_info","mal_link","img_url","type"]
+        with open(fn, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for row in self._filtered:
+                r2 = dict(row)
+                for k in ("genres","themes","demographics"):
+                    r2[k] = ", ".join(r2.get(k,[]))
+                w.writerow(r2)
+        messagebox.showinfo("Exported", f"Saved:\n{os.path.abspath(fn)}")
+
+
+if __name__ == "__main__":
+    app = MALScraperApp()
+    app.mainloop()
